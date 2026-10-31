@@ -1,0 +1,26 @@
+[project]
+name = "beliefs"
+version = "0.1.0"
+description = "Agent memory as graded beliefs that update on evidence"
+authors = [
+    { name = "Jason Roberts", email = "jason@jasonroberts.io" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=2.3.0",
+    "fastembed>=0.9.1",
+    "mcp>=2.3.0",
+    "numpy>=2.5.4",
+]
+
+[project.scripts]
+beliefs = "beliefs.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
