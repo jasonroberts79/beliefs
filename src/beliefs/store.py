@@ -19,6 +19,7 @@ import numpy as np
 
 PRIOR = 0.5  # support and against counts of a belief before any evidence
 WEIGHTS = {"user_said": 1.0, "tool_observed": 1.0, "document": 0.5, "agent_inferred": 0.2}
+STRONG = {"user_said", "tool_observed"}  # the only sources that may close or override a belief
 CANDIDATES = 8  # beliefs the judge sees per observation
 TIE = 0.05  # ponytail: fixed recall tie margin; tune from real recall logs
 DIGEST = 20  # firm beliefs in the startup digest; Claude Code truncates long instructions
@@ -213,7 +214,14 @@ class Store:
                 action = "new"  # the judge named a belief it was not shown
             if action == "carve" and len(env) <= len(target.context):
                 action = "contradicts"  # no narrower context exists here
-            if target is not None and action in ("supports", "contradicts", "supersedes"):
+            # A document or a guess must not close or override a belief on its own. It contradicts
+            # the belief at its own weight and starts a rival, so the user settles the pair.
+            rival = action in ("supersedes", "carve") and source_kind not in STRONG
+            if rival:
+                if target.id not in touched:
+                    touched.add(target.id)
+                    plans.append(("contradicts", target, None))
+            elif target is not None and action in ("supports", "contradicts", "supersedes"):
                 if target.id in touched:
                     continue  # one observation counts once per belief
                 touched.add(target.id)
@@ -227,9 +235,9 @@ class Store:
                 ctx, labels = _prefix(e.context or [], env), e.labels or []
                 if action == "carve" and len(ctx) <= len(target.context):
                     ctx = env
-            plans.append((action, target, {
+            plans.append(("rival" if rival else action, target, {
                 "statement": e.statement or statement, "context": list(ctx), "labels": labels,
-                "premises": list(premises), "narrows": target.id if action == "carve" else None,
+                "premises": list(premises), "narrows": target.id if action == "carve" and not rival else None,
             }))
 
         new_texts = [c["statement"] for _, _, c in plans if c]
@@ -250,7 +258,8 @@ class Store:
                     self._record("evidence", new_id, {**evidence, "verdict": "supersedes", "old": target.id})
                 else:
                     self._record("evidence", new_id, {**evidence, "verdict": "supports"})
-                how = "new" if action == "new" else f"{'carved from' if action == 'carve' else 'supersedes'} #{target.id}"
+                verb = {"carve": "carved from", "supersedes": "supersedes", "rival": "rival to"}.get(action)
+                how = f"{verb} #{target.id}" if verb else "new"
                 results.append((how, new_id))
         return "\n".join(f"{how}: {render(self.get(i))}" for how, i in results) or "irrelevant: no belief changed"
 
