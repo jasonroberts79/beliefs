@@ -2,13 +2,14 @@
 
 import hashlib
 import subprocess
+import threading
 
 import numpy as np
 import pytest
 
 from beliefs.judge import Effect, Verdict
-from beliefs.server import environment
-from beliefs.store import PRIOR, Store
+from beliefs.server import build, environment
+from beliefs.store import PRIOR, Store, Unavailable
 
 ENV = ("owner:me", "repo:a")
 OTHER = ("owner:me", "repo:b")
@@ -152,6 +153,86 @@ def test_each_source_holds_one_latest_vote_per_belief(s):
     assert snapshot(s) == before
 
 
+def test_a_weak_source_never_replaces_the_users_vote_from_the_same_session(s):
+    new_python(s, ref="session:1")
+    s.observe("looks like Rust", "agent_inferred", "session:1", ENV, says(action="contradicts", belief_id=1))
+    assert (s.get(1).support, s.get(1).against, s.get(1).n) == (1.5, pytest.approx(0.7), 2)
+
+
+def down(*args):
+    raise Unavailable("connection refused")
+
+
+def test_an_outage_queues_statements_and_judges_them_in_order_later(s):
+    assert s.observe("I write Python", "user_said", "s1", ENV, down).startswith("queued")
+    s.observe("I switched to Rust", "user_said", "s2", ENV, down)
+    s.replay()  # the queue is input, so replay keeps it
+    assert s.beliefs() == [] and s.db.execute("SELECT COUNT(*) FROM pending").fetchone()[0] == 2
+
+    seen = []
+    verdicts = {"I write Python": says(action="new", statement="User writes Python", context=[]),
+                "I switched to Rust": says(action="supersedes", belief_id=1, statement="User writes Rust"),
+                "I use zsh": says(action="new", statement="User uses zsh", context=[])}
+    def judge(statement, *rest):
+        seen.append(statement)
+        return verdicts[statement](statement, *rest)
+    s.observe("I use zsh", "user_said", "s3", ENV, judge)
+    assert seen == ["I write Python", "I switched to Rust", "I use zsh"]
+    assert [b.statement for b in s.recall(ENV)] == ["User writes Rust", "User uses zsh"]
+    assert s.db.execute("SELECT COUNT(*) FROM pending").fetchone()[0] == 0
+
+
+def test_a_queued_statement_the_judge_rejects_is_dropped_instead_of_blocking(s):
+    s.observe("bad", "user_said", "s1", ENV, down)
+    def judge(statement, *rest):
+        if statement == "bad":
+            raise RuntimeError("judge stopped with refusal")
+        return says(action="new", statement="User uses zsh", context=[])()
+    out = s.observe("I use zsh", "user_said", "s2", ENV, judge)
+    assert "dropped queued statement 'bad'" in out and s.get(1).statement == "User uses zsh"
+
+
+def test_parallel_tool_calls_keep_separate_transactions(s):
+    gate, errors, first = threading.Barrier(2, timeout=5), [], set()
+    def judge(statement, *rest):
+        if statement not in first:  # both calls leave their first judging together, then race to write
+            first.add(statement)
+            gate.wait()
+        return says(action="new", statement=statement, context=[])()
+    def call(text):
+        try:
+            s.observe(text, "user_said", text, ENV, judge)
+        except Exception as e:
+            errors.append(e)
+    threads = [threading.Thread(target=call, args=(t,)) for t in ("I use zsh", "I use vim")]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == [] and len(s.beliefs()) == 2
+
+
+def test_a_write_during_judging_makes_observe_judge_again(s):
+    seen = []
+    def judge(statement, source_kind, env, candidates, labels):
+        seen.append([b.id for b in candidates])
+        if len(seen) == 1:  # another session records the same fact while this judge call runs
+            s.observe("we use pnpm", "user_said", "other", ENV, says(action="new", statement="Repo uses pnpm", context=list(ENV)))
+            return says(action="new", statement="Repo uses pnpm", context=list(ENV))()
+        return says(action="supports", belief_id=candidates[0].id)()
+    s.observe("pnpm-lock.yaml is present", "tool_observed", "t1", ENV, judge)
+    assert seen == [[], [1]] and len(s.beliefs()) == 1 and s.get(1).n == 2
+
+
+def test_re_judging_gives_up_after_two_retries(s):
+    calls = []
+    def judge(statement, *rest):
+        calls.append(statement)
+        if statement == "pnpm":  # every judge call races with another write
+            s.observe(f"noise {len(calls)}", "user_said", "other", ENV, says())
+        return says(action="new", statement="Repo uses pnpm", context=list(ENV))()
+    s.observe("pnpm", "tool_observed", "t1", ENV, judge)
+    assert calls.count("pnpm") == 3 and len(s.beliefs()) == 1
+
+
 def test_effects_on_the_same_belief_count_once(s):
     new_python(s)
     s.observe("Python", "user_said", "s2", ENV, says(dict(action="supports", belief_id=1), dict(action="supports", belief_id=1)))
@@ -234,3 +315,32 @@ def test_environment_reads_remote_and_folder_map(tmp_path):
     plain = tmp_path / "scratch"
     plain.mkdir()
     assert environment(plain, tmp_path / "missing.json") == ("repo:scratch",)
+
+
+def git_repo(path):
+    path.mkdir(parents=True)
+    git = lambda *a: subprocess.run(["git", "-C", str(path), *a], check=True, capture_output=True, text=True).stdout
+    git("init", "-q")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "first")
+    return git, f"repo:{git('rev-parse', 'HEAD')[:12]}"
+
+
+def test_a_repo_without_a_remote_is_named_by_its_first_commit(tmp_path):
+    git, root = git_repo(tmp_path / "api")
+    assert environment(tmp_path / "api", tmp_path / "missing.json") == (root,)
+    (tmp_path / "api").rename(tmp_path / "api-v2")
+    assert environment(tmp_path / "api-v2", tmp_path / "missing.json") == (root,)  # survives a rename
+
+
+def test_beliefs_follow_a_repo_when_it_gains_a_remote(tmp_path, monkeypatch):
+    git, root = git_repo(tmp_path / "api")
+    monkeypatch.setenv("BELIEFS_DB", str(tmp_path / "b.db"))
+    monkeypatch.chdir(tmp_path / "api")
+    s = Store(embed=fake_embed)
+    s.observe("tests use pytest", "user_said", "s1", (root,), says(action="new", statement="Tests use pytest", context=[root]))
+    git("remote", "add", "origin", "git@github.com:acme/api.git")
+    build()
+    remote = ("owner:acme", "repo:api")
+    assert [b.statement for b in s.recall(remote)] == ["Tests use pytest"]
+    s.replay()
+    assert s.get(1).context == remote

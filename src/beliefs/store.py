@@ -7,6 +7,7 @@ applying those events in order, so `replay()` can always rebuild it from scratch
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
@@ -31,7 +32,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
-    kind TEXT NOT NULL,           -- created | evidence | label_merged | retracted | settled
+    kind TEXT NOT NULL,           -- created | evidence | label_merged | context_moved | retracted | settled
     belief_id INTEGER,
     data TEXT NOT NULL
 );
@@ -52,12 +53,22 @@ CREATE TABLE IF NOT EXISTS beliefs (
 );
 CREATE TABLE IF NOT EXISTS votes (  -- each source's latest vote per belief; part of the snapshot
     source_ref TEXT NOT NULL,
+    source_kind TEXT NOT NULL,    -- part of the key, so a weak source never replaces a strong vote
     belief_id INTEGER NOT NULL,
     side TEXT NOT NULL,           -- support | against
     weight REAL NOT NULL,
-    PRIMARY KEY (source_ref, belief_id)
+    PRIMARY KEY (source_ref, source_kind, belief_id)
+);
+CREATE TABLE IF NOT EXISTS pending (  -- observations waiting for the judge; input, so replay keeps them
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    data TEXT NOT NULL
 );
 """
+
+
+class Unavailable(Exception):
+    """The judge cannot be reached right now, so the observation waits in the queue."""
 
 
 @dataclass
@@ -127,15 +138,23 @@ def _prefix(ctx: list[str], env: tuple[str, ...]) -> tuple[str, ...]:
 
 class Store:
     def __init__(self, path=None, embed=default_embed):
-        path = Path(path or os.environ.get("BELIEFS_DB", HOME / "beliefs.db"))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Tools may run on worker threads; every write still goes through _tx.
-        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA busy_timeout=5000")
+        self.path = Path(path or os.environ.get("BELIEFS_DB", HOME / "beliefs.db"))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self.db.executescript(SCHEMA)
         self.embed = embed
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        """This thread's connection. MCP tools run on worker threads, and SQLite keeps transaction
+        state per connection, so threads that shared one would mix their transactions."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._local.conn = sqlite3.connect(self.path, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+        return conn
 
     @contextmanager
     def _tx(self):
@@ -207,7 +226,70 @@ class Store:
     def observe(self, statement, source_kind, source_ref, env, judge, premises=()) -> str:
         if source_kind not in WEIGHTS:
             raise ValueError(f"source_kind must be one of {sorted(WEIGHTS)}")
-        env = tuple(env)
+        item = {"statement": statement, "source_kind": source_kind, "source_ref": source_ref,
+                "env": list(env), "premises": list(premises)}
+        try:
+            dropped = self.drain(judge)  # older queued statements go first, so order is kept
+            return "\n".join([self._judge(item, judge), *dropped])
+        except Unavailable:
+            ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            with self._tx():
+                self.db.execute("INSERT INTO pending (ts, data) VALUES (?, ?)", (ts, json.dumps(item)))
+            return "queued: the judge is unreachable, so this statement will be judged on a later call"
+
+    def drain(self, judge) -> list[str]:
+        """Judge queued statements oldest first. Raises Unavailable if the judge is still down."""
+        dropped = []
+        for row in self.db.execute("SELECT id, data FROM pending ORDER BY id").fetchall():
+            item = json.loads(row["data"])
+            try:
+                self._judge(item, judge, pending=row["id"])
+            except Unavailable:
+                raise
+            except Exception as e:  # a statement the judge always rejects must not block the queue
+                with self._tx():
+                    self.db.execute("DELETE FROM pending WHERE id = ?", (row["id"],))
+                dropped.append(f"dropped queued statement {item['statement']!r}: {e}")
+        return dropped
+
+    def _judge(self, item: dict, judge, pending: int | None = None) -> str:
+        # The judge takes seconds and holds no lock. If another call writes meanwhile, this verdict may
+        # miss a belief that call just created, so judge again against the new state, at most twice.
+        for attempt in range(3):
+            head = self._head()
+            evidence, plans, vecs = self._plan(item, judge)
+            results = []  # (how, belief_id)
+            with self._tx():
+                if attempt < 2 and self._head() != head:
+                    continue
+                if pending is not None and not self.db.execute("DELETE FROM pending WHERE id = ?", (pending,)).rowcount:
+                    return "already judged by another session"
+                if not plans:
+                    self._record("evidence", None, {**evidence, "verdict": "irrelevant"})
+                for action, target, created in plans:
+                    if created is None:
+                        self._record("evidence", target.id, {**evidence, "verdict": action})
+                        results.append((action, target.id))
+                        continue
+                    seq = self.db.execute("SELECT seq FROM sqlite_sequence WHERE name = 'beliefs'").fetchone()
+                    new_id = (seq[0] if seq else 0) + 1  # AUTOINCREMENT never reuses a purged id
+                    self._record("created", new_id, created, next(vecs).tobytes())
+                    if action == "supersedes":
+                        self._record("evidence", new_id, {**evidence, "verdict": "supersedes", "old": target.id})
+                    else:
+                        self._record("evidence", new_id, {**evidence, "verdict": "supports"})
+                    verb = {"carve": "carved from", "supersedes": "supersedes", "rival": "rival to"}.get(action)
+                    how = f"{verb} #{target.id}" if verb else "new"
+                    results.append((how, new_id))
+            return "\n".join(f"{how}: {render(self.get(i))}" for how, i in results) or "irrelevant: no belief changed"
+
+    def _head(self) -> int:
+        return self.db.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
+
+    def _plan(self, item: dict, judge):
+        """Ask the judge about one statement, and turn its verdict into the writes it implies."""
+        statement, source_kind, source_ref = item["statement"], item["source_kind"], item["source_ref"]
+        env, premises = tuple(item["env"]), item["premises"]
         pool = [b for b in self.beliefs("status = 'open' AND n > 0") if b.applies(env)]
         candidates = self.similar(self.embed([statement])[0], pool, CANDIDATES)
         v = judge(statement, source_kind, env, candidates, self.labels())
@@ -250,27 +332,7 @@ class Store:
             }))
 
         new_texts = [c["statement"] for _, _, c in plans if c]
-        vecs = iter(self.embed(new_texts) if new_texts else [])
-        results = []  # (how, belief_id)
-        with self._tx():
-            if not plans:
-                self._record("evidence", None, {**evidence, "verdict": "irrelevant"})
-            for action, target, created in plans:
-                if created is None:
-                    self._record("evidence", target.id, {**evidence, "verdict": action})
-                    results.append((action, target.id))
-                    continue
-                seq = self.db.execute("SELECT seq FROM sqlite_sequence WHERE name = 'beliefs'").fetchone()
-                new_id = (seq[0] if seq else 0) + 1  # AUTOINCREMENT never reuses a purged id
-                self._record("created", new_id, created, next(vecs).tobytes())
-                if action == "supersedes":
-                    self._record("evidence", new_id, {**evidence, "verdict": "supersedes", "old": target.id})
-                else:
-                    self._record("evidence", new_id, {**evidence, "verdict": "supports"})
-                verb = {"carve": "carved from", "supersedes": "supersedes", "rival": "rival to"}.get(action)
-                how = f"{verb} #{target.id}" if verb else "new"
-                results.append((how, new_id))
-        return "\n".join(f"{how}: {render(self.get(i))}" for how, i in results) or "irrelevant: no belief changed"
+        return evidence, plans, iter(self.embed(new_texts) if new_texts else [])
 
     def _record(self, kind: str, belief_id: int | None, data: dict, embedding: bytes | None = None) -> int:
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -305,21 +367,22 @@ class Store:
             self.db.execute("DELETE FROM votes WHERE belief_id = ?", (belief_id,))
         elif kind == "evidence":
             verdict = data["verdict"]
-            ref = data["source_ref"]
+            ref, src = data["source_ref"], data["source_kind"]
             if verdict == "irrelevant" or self._retracted(ref):
                 return
-            # A source holds one vote per belief: its newest observation replaces its older one,
-            # so re-reading the same README in every session never adds weight.
+            # A source (kind plus ref) holds one vote per belief: its newest observation replaces its
+            # older one, so re-reading the same README in every session never adds weight.
             old = self.db.execute(
-                "SELECT side, weight FROM votes WHERE source_ref = ? AND belief_id = ?", (ref, belief_id)
+                "SELECT side, weight FROM votes WHERE source_ref = ? AND source_kind = ? AND belief_id = ?",
+                (ref, src, belief_id),
             ).fetchone()
             if old:
                 self.db.execute(f"UPDATE beliefs SET {old['side']} = {old['side']} - ? WHERE id = ?",
                                 (old["weight"], belief_id))
-            side, weight = ("against" if verdict == "contradicts" else "support"), WEIGHTS[data["source_kind"]]
+            side, weight = ("against" if verdict == "contradicts" else "support"), WEIGHTS[src]
             self.db.execute(f"UPDATE beliefs SET {side} = {side} + ?, n = n + ? WHERE id = ?",
                             (weight, 0 if old else 1, belief_id))
-            self.db.execute("INSERT OR REPLACE INTO votes VALUES (?, ?, ?, ?)", (ref, belief_id, side, weight))
+            self.db.execute("INSERT OR REPLACE INTO votes VALUES (?, ?, ?, ?, ?)", (ref, src, belief_id, side, weight))
             if verdict == "supersedes":
                 self.db.execute(
                     "UPDATE beliefs SET status = 'closed', superseded_by = ? WHERE id = ?", (belief_id, data["old"])
@@ -330,6 +393,13 @@ class Store:
                 if data["old"] in labels:
                     merged = list(dict.fromkeys(data["new"] if x == data["old"] else x for x in labels))
                     self.db.execute("UPDATE beliefs SET labels = ? WHERE id = ?", (json.dumps(merged), row["id"]))
+        elif kind == "context_moved":
+            for row in self.db.execute("SELECT id, context FROM beliefs").fetchall():
+                ctx = json.loads(row["context"])
+                if data["old"] in ctx:
+                    i = ctx.index(data["old"])
+                    moved = ctx[:i] + data["new"] + ctx[i + 1:]
+                    self.db.execute("UPDATE beliefs SET context = ? WHERE id = ?", (json.dumps(moved), row["id"]))
         elif kind == "settled":
             if data["winner"] is not None and not self._retracted(data["source_ref"]):
                 loser = data["b"] if data["winner"] == data["a"] else data["a"]
@@ -402,3 +472,10 @@ class Store:
     def merge_labels(self, old: str, new: str) -> None:
         with self._tx():
             self._record("label_merged", None, {"old": old, "new": new})
+
+    def move_context(self, old: str, new: list[str]) -> None:
+        """Replace context element `old` with `new` in every belief that has it, such as a root commit
+        id with owner and repo once the repo gets a remote. A logged event, so replay keeps it."""
+        if self.db.execute("SELECT 1 FROM beliefs WHERE context LIKE ?", (f"%{json.dumps(old)}%",)).fetchone():
+            with self._tx():
+                self._record("context_moved", None, {"old": old, "new": new})

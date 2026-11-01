@@ -13,7 +13,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from pydantic import create_model
 
 from beliefs.judge import judge
-from beliefs.store import HOME, Belief, Store, render
+from beliefs.store import HOME, Belief, Store, Unavailable, render
 
 # Each Claude Code session starts its own stdio server, so this names the session.
 SESSION = f"session:{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
@@ -38,6 +38,12 @@ def _git(path: Path, *args: str) -> str | None:
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 
+def _root(path: Path) -> str | None:
+    """The repo's first commit as a context element. It survives renames and moves, unlike the folder name."""
+    roots = _git(path, "rev-list", "--max-parents=0", "HEAD")  # merged histories have several, newest first
+    return f"repo:{roots.splitlines()[-1][:12]}" if roots else None
+
+
 def environment(path=None, config: Path = HOME / "config.json") -> tuple[str, ...]:
     """Context tuple for a folder: optional heads from the folder map, then owner and repo."""
     path = Path(path or os.getcwd()).resolve()
@@ -50,7 +56,7 @@ def environment(path=None, config: Path = HOME / "config.json") -> tuple[str, ..
             heads = max(matches, key=lambda kv: len(kv[0].parts))[1]
     if m := re.search(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$", _git(path, "remote", "get-url", "origin") or ""):
         return (*heads, f"owner:{m[1]}", f"repo:{m[2]}")
-    return (*heads, f"repo:{Path(_git(path, 'rev-parse', '--show-toplevel') or path).name}")
+    return (*heads, _root(path) or f"repo:{Path(_git(path, 'rev-parse', '--show-toplevel') or path).name}")
 
 
 def _lines(beliefs: list[Belief], conflicts: list[tuple[Belief, Belief]]) -> list[str]:
@@ -80,6 +86,8 @@ async def ask_user(ctx: Context, a: Belief, b: Belief) -> int | None | bool:
 def build() -> MCPServer:
     store = Store()
     env = environment()
+    if (root := _root(Path.cwd())) and root not in env:  # the repo has gained a remote since
+        store.move_context(root, list(env[-2:]))
     asked: set[frozenset[int]] = set()  # never ask about the same pair twice in one session
     digest = "\n".join(f"- {line}" for line in _lines(store.digest(env), store.conflicts())) or "(none yet)"
     server = MCPServer("beliefs", instructions=GUIDE.format(context="/".join(env), digest=digest))
@@ -107,6 +115,11 @@ def build() -> MCPServer:
 
         labels: optionally keep only beliefs carrying one of these labels.
         """
+        try:
+            notes = store.drain(judge)  # statements queued during an outage count before this recall
+        except Unavailable:
+            waiting = store.db.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
+            notes = [f"{waiting} recent statement(s) wait for the judge, so newer facts may be missing"]
         found = store.recall(env, query, labels)
         ids = {b.id for b in found}
         for a, b in store.conflicts():
@@ -117,6 +130,6 @@ def build() -> MCPServer:
                 if answer is not False:
                     store.settle(a.id, b.id, answer, SESSION)
                     found = store.recall(env, query, labels)
-        return "\n".join(_lines(found, store.conflicts())) or "No beliefs match."
+        return "\n".join([*_lines(found, store.conflicts()), *notes]) or "No beliefs match."
 
     return server

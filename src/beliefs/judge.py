@@ -8,6 +8,8 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel
 
+from beliefs.store import Unavailable
+
 MODEL = os.environ.get("BELIEFS_JUDGE_MODEL", "claude-haiku-5-5")
 
 Action = Literal["supports", "contradicts", "supersedes", "carve", "new"]
@@ -80,14 +82,20 @@ def judge(statement: str, source_kind: str, env: tuple[str, ...], candidates: li
         ],
         "existing_labels": labels,
     }
-    response = _client().messages.parse(
-        model=MODEL,
-        max_tokens=4096,
-        system=SYSTEM,
-        output_config={"effort": "low"},
-        messages=[{"role": "user", "content": json.dumps(payload, indent=1)}],
-        output_format=Verdict,
-    )
+    try:
+        response = _client().messages.parse(
+            model=MODEL,
+            max_tokens=4096,
+            system=SYSTEM,
+            output_config={"effort": "low"},
+            messages=[{"role": "user", "content": json.dumps(payload, indent=1)}],
+            output_format=Verdict,
+        )
+    except anthropic.APIError as e:  # an outage queues the statement; anything else is a real error
+        status = getattr(e, "status_code", 0)
+        if isinstance(e, anthropic.APIConnectionError) or status == 429 or status >= 500:
+            raise Unavailable(str(e)) from e
+        raise
     if response.stop_reason != "end_turn" or response.parsed_output is None:
         raise RuntimeError(f"judge stopped with {response.stop_reason} (request {response._request_id})")
     return response.parsed_output
