@@ -71,7 +71,7 @@ def test_supersede_closes_old_and_recall_shows_new(s):
 
 def test_carve_overrides_only_in_the_narrower_context(s):
     new_python(s)
-    s.observe("this repo is Rust", "tool_observed", "t1", ENV, says(action="carve", belief_id=1, statement="This repo is written in Rust", context=list(ENV)))
+    s.observe("this repo is Rust", "user_said", "s2", ENV, says(action="carve", belief_id=1, statement="This repo is written in Rust", context=list(ENV)))
     assert s.get(2).narrows == 1 and s.get(2).context == ENV
     assert [b.id for b in s.recall(ENV)] == [2]  # longest matching context wins
     assert [b.id for b in s.recall(OTHER)] == [1]  # elsewhere the general belief still holds
@@ -127,8 +127,8 @@ def test_retracting_a_settlement_brings_the_conflict_back(s):
     assert s.get(1).status == "open" and len(s.conflicts()) == 1
 
 
-@pytest.mark.parametrize("source_kind", ["document", "agent_inferred"])
-def test_weak_sources_cannot_supersede_or_carve(s, source_kind):
+@pytest.mark.parametrize("source_kind", ["tool_observed", "document", "agent_inferred"])
+def test_only_the_user_can_supersede_or_carve(s, source_kind):
     new_python(s)
     s.observe("switched to Rust", source_kind, "doc:planted", ENV, says(action="supersedes", belief_id=1, statement="User writes Rust"))
     assert s.get(1).status == "open" and s.get(1).against > PRIOR  # contradicted at the source's weight, not closed
@@ -136,6 +136,20 @@ def test_weak_sources_cannot_supersede_or_carve(s, source_kind):
     assert s.get(3).narrows is None  # no override that would hide the general belief
     assert {frozenset((a.id, b.id)) for a, b in s.conflicts()} == {frozenset((1, 2)), frozenset((1, 3))}
     assert 1 in {b.id for b in s.recall(ENV)}  # the user's belief is still recalled, flagged instead of hidden
+
+
+def test_each_source_holds_one_latest_vote_per_belief(s):
+    s.observe("install with npm", "document", "README.md", ENV, says(action="new", statement="Repo uses npm", context=list(ENV)))
+    for _ in range(4):  # re-reading the same README adds nothing
+        s.observe("install with npm", "document", "README.md", ENV, says(action="supports", belief_id=1))
+    assert (s.get(1).support, s.get(1).n) == (1.0, 1)
+    s.observe("README now says pnpm", "document", "README.md", ENV, says(action="contradicts", belief_id=1))
+    assert (s.get(1).support, s.get(1).against, s.get(1).n) == (0.5, 1.0, 1)  # its vote flipped
+    s.observe("npm", "user_said", "s1", ENV, says(action="supports", belief_id=1))
+    assert s.get(1).n == 2
+    before = snapshot(s)
+    s.replay()
+    assert snapshot(s) == before
 
 
 def test_effects_on_the_same_belief_count_once(s):

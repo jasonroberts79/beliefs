@@ -19,7 +19,9 @@ import numpy as np
 
 PRIOR = 0.5  # support and against counts of a belief before any evidence
 WEIGHTS = {"user_said": 1.0, "tool_observed": 1.0, "document": 0.5, "agent_inferred": 0.2}
-STRONG = {"user_said", "tool_observed"}  # the only sources that may close or override a belief
+# The only source that may close or override a belief. Anything else starts a conflict for the user.
+# ponytail: still trusts the agent's user_said label; grounding it in real prompts needs a hook.
+STRONG = {"user_said"}
 CANDIDATES = 8  # beliefs the judge sees per observation
 TIE = 0.05  # ponytail: fixed recall tie margin; tune from real recall logs
 DIGEST = 20  # firm beliefs in the startup digest; Claude Code truncates long instructions
@@ -43,10 +45,17 @@ CREATE TABLE IF NOT EXISTS beliefs (
     narrows INTEGER,              -- the general belief this one carves an exception from
     support REAL NOT NULL,
     against REAL NOT NULL,
-    n INTEGER NOT NULL,           -- evidence events applied
+    n INTEGER NOT NULL,           -- sources currently holding a vote
     status TEXT NOT NULL,         -- open | closed
     superseded_by INTEGER,
     embedding BLOB
+);
+CREATE TABLE IF NOT EXISTS votes (  -- each source's latest vote per belief; part of the snapshot
+    source_ref TEXT NOT NULL,
+    belief_id INTEGER NOT NULL,
+    side TEXT NOT NULL,           -- support | against
+    weight REAL NOT NULL,
+    PRIMARY KEY (source_ref, belief_id)
 );
 """
 
@@ -92,7 +101,7 @@ def render(b: Belief) -> str:
         "almost certainly not"
     )
     where = "/".join(b.context) or "everywhere"
-    text = f"#{b.id} {hedge}: {b.statement} ({b.n} observation{'' if b.n == 1 else 's'}; {where})"
+    text = f"#{b.id} {hedge}: {b.statement} ({b.n} source{'' if b.n == 1 else 's'}; {where})"
     return text + (" - verify before acting on this" if b.loose else "")
 
 
@@ -293,15 +302,24 @@ class Store:
                 (belief_id, data["statement"], json.dumps(data["context"]), json.dumps(data["labels"]),
                  json.dumps(data["premises"]), data["narrows"], PRIOR, PRIOR, embedding),
             )
+            self.db.execute("DELETE FROM votes WHERE belief_id = ?", (belief_id,))
         elif kind == "evidence":
             verdict = data["verdict"]
-            if verdict == "irrelevant" or self._retracted(data["source_ref"]):
+            ref = data["source_ref"]
+            if verdict == "irrelevant" or self._retracted(ref):
                 return
-            column = "against" if verdict == "contradicts" else "support"
-            self.db.execute(
-                f"UPDATE beliefs SET {column} = {column} + ?, n = n + 1 WHERE id = ?",
-                (WEIGHTS[data["source_kind"]], belief_id),
-            )
+            # A source holds one vote per belief: its newest observation replaces its older one,
+            # so re-reading the same README in every session never adds weight.
+            old = self.db.execute(
+                "SELECT side, weight FROM votes WHERE source_ref = ? AND belief_id = ?", (ref, belief_id)
+            ).fetchone()
+            if old:
+                self.db.execute(f"UPDATE beliefs SET {old['side']} = {old['side']} - ? WHERE id = ?",
+                                (old["weight"], belief_id))
+            side, weight = ("against" if verdict == "contradicts" else "support"), WEIGHTS[data["source_kind"]]
+            self.db.execute(f"UPDATE beliefs SET {side} = {side} + ?, n = n + ? WHERE id = ?",
+                            (weight, 0 if old else 1, belief_id))
+            self.db.execute("INSERT OR REPLACE INTO votes VALUES (?, ?, ?, ?)", (ref, belief_id, side, weight))
             if verdict == "supersedes":
                 self.db.execute(
                     "UPDATE beliefs SET status = 'closed', superseded_by = ? WHERE id = ?", (belief_id, data["old"])
@@ -355,6 +373,7 @@ class Store:
     # --- exceptional operations (command line only) ---
 
     def _replay(self) -> None:
+        self.db.execute("DELETE FROM votes")
         for e in self.db.execute("SELECT kind, belief_id, data FROM events ORDER BY id").fetchall():
             self._apply(e["kind"], e["belief_id"], json.loads(e["data"]))
 
