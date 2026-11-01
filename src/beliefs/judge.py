@@ -99,3 +99,72 @@ def judge(statement: str, source_kind: str, env: tuple[str, ...], candidates: li
     if response.stop_reason != "end_turn" or response.parsed_output is None:
         raise RuntimeError(f"judge stopped with {response.stop_reason} (request {response._request_id})")
     return response.parsed_output
+
+
+# --- sleep: an offline pass over the whole memory, run by `beliefs sleep` ---
+
+SLEEP_MODEL = os.environ.get("BELIEFS_SLEEP_MODEL", "claude-sonnet-5-5")
+
+
+class Merge(BaseModel):
+    reason: str
+    ids: list[int]  # beliefs that state the same fact in the same context
+
+
+class LabelMerge(BaseModel):
+    reason: str
+    old: str
+    new: str
+
+
+class Generalization(BaseModel):
+    reason: str
+    ids: list[int]  # the repo-level beliefs that suggest it
+    statement: str
+
+
+class Consolidation(BaseModel):
+    merges: list[Merge] = []
+    labels: list[LabelMerge] = []
+    generalizations: list[Generalization] = []
+
+
+SLEEP = """You consolidate an agent's long-term memory offline, the way sleep consolidates a day's \
+memories. You see every open belief at once: its id, statement, context and labels. A context is an \
+ordered tuple from general to specific, such as ["owner:acme", "repo:api"]; [] means everywhere.
+
+Return three lists. Start each item with a one-sentence reason.
+
+merges: groups of beliefs that state the same fact in the same context in different words.
+- Only group beliefs whose contexts are identical.
+- Never group beliefs that differ in any detail. A different port, version, tool, path, person or \
+polarity makes them different facts, however alike the wording.
+- Leave a belief out when unsure. A missed merge costs little, but a wrong one hides a fact.
+
+labels: pairs of labels that mean the same thing. Fold `old` into `new`, and pick as `new` the label \
+more beliefs already use. Leave labels alone that differ in scope, such as testing and ci.
+
+generalizations: a lasting fact about the user that beliefs from three or more different repos \
+suggest together, such as "The user prefers pnpm" from three repos that each use pnpm.
+- List the ids of the supporting beliefs, from at least three different contexts.
+- Skip it when an existing belief already says it, or when any belief contradicts the pattern.
+
+Return empty lists when nothing qualifies."""
+
+
+def consolidate(beliefs: list, label_counts: dict[str, int]) -> Consolidation:
+    payload = {
+        "beliefs": [{"id": b.id, "statement": b.statement, "context": list(b.context), "labels": b.labels}
+                    for b in beliefs],
+        "labels": label_counts,
+    }
+    response = _client().messages.parse(
+        model=SLEEP_MODEL,
+        max_tokens=16000,
+        system=SLEEP,
+        messages=[{"role": "user", "content": json.dumps(payload, indent=1)}],
+        output_format=Consolidation,
+    )
+    if response.stop_reason != "end_turn" or response.parsed_output is None:
+        raise RuntimeError(f"sleep stopped with {response.stop_reason} (request {response._request_id})")
+    return response.parsed_output

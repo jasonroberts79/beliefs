@@ -22,6 +22,7 @@ def main(argv=None) -> None:
     settle.add_argument("winner", type=int)
     settle.add_argument("loser", type=int)
     settle.add_argument("--both", action="store_true", help="both hold; neither closes")
+    sub.add_parser("sleep", help="consolidate offline: merge duplicates and labels you confirm, generalize across repos")
     a = p.parse_args(argv)
 
     if a.cmd == "serve":
@@ -33,7 +34,7 @@ def main(argv=None) -> None:
     store = Store()
     if a.cmd == "show" and a.id is None:
         for b in store.beliefs():
-            print(render(b) + ("" if b.status == "open" else f" [closed, replaced by #{b.superseded_by}]"))
+            print(render(b) + ("" if b.status == "open" else f" [{b.status}, replaced by #{b.superseded_by}]"))
     elif a.cmd == "show":
         b = store.get(a.id)
         if b is None:
@@ -58,3 +59,8 @@ def main(argv=None) -> None:
             print(f"{render(x)}\n  vs {render(y)}\n  settle with: beliefs settle {x.id} {y.id}  (or {y.id} {x.id}, or --both)")
     elif a.cmd == "settle":
         store.settle(a.winner, a.loser, None if a.both else a.winner, "cli")
+    elif a.cmd == "sleep":
+        from beliefs.judge import consolidate, judge
+
+        lines = store.sleep(consolidate, judge, lambda q: input(f"{q}\n[y/N] ").strip().lower() == "y")
+        print("\n".join(lines) or "nothing to consolidate")

@@ -7,7 +7,7 @@ import threading
 import numpy as np
 import pytest
 
-from beliefs.judge import Effect, Verdict
+from beliefs.judge import Consolidation, Effect, Generalization, LabelMerge, Merge, Verdict
 from beliefs.server import build, environment
 from beliefs.store import PRIOR, Store, Unavailable
 
@@ -344,3 +344,61 @@ def test_beliefs_follow_a_repo_when_it_gains_a_remote(tmp_path, monkeypatch):
     assert [b.statement for b in s.recall(remote)] == ["Tests use pytest"]
     s.replay()
     assert s.get(1).context == remote
+
+
+def pnpm(s, ref, env=ENV):
+    return s.observe("pnpm", "tool_observed", ref, env, says(action="new", statement="Repo uses pnpm", context=list(env), labels=["build"]))
+
+
+def dreams(**plan):
+    return lambda beliefs, labels: Consolidation(**plan)
+
+
+def test_sleep_merges_only_the_duplicates_you_confirm_and_keeps_their_evidence(s):
+    pnpm(s, "t1")
+    s.observe("pnpm again", "user_said", "s1", ENV, says(action="supports", belief_id=1))
+    pnpm(s, "t2")  # a duplicate, written by a session that raced the first
+    plan = dreams(merges=[Merge(reason="same fact", ids=[1, 2])])
+    assert s.sleep(plan, None, lambda q: False) == [] and s.get(2).status == "open"
+    assert s.sleep(plan, None, lambda q: True) == ["merged #2 into #1"]
+    assert (s.get(2).status, s.get(2).superseded_by) == ("merged", 1)
+    assert s.get(1).n == 3 and [b.id for b in s.recall(ENV)] == [1]  # t2's vote moved over
+    before = snapshot(s)
+    s.replay()
+    assert snapshot(s) == before
+
+
+def test_sleep_never_merges_across_contexts(s):
+    pnpm(s, "t1")
+    pnpm(s, "t2", OTHER)
+    assert s.sleep(dreams(merges=[Merge(reason="same", ids=[1, 2])]), None, lambda q: True) == []
+
+
+def test_a_conflict_follows_a_merged_duplicate(s):
+    rivals(s)  # npm #1 against pnpm #2
+    s.observe("npm", "user_said", "s1", ENV, says(action="new", statement="Repo uses npm", context=list(ENV)))
+    s.observe("npm", "user_said", "s2", ENV, says(action="supports", belief_id=3))
+    s.sleep(dreams(merges=[Merge(reason="same", ids=[1, 3])]), None, lambda q: True)
+    assert [(a.id, b.id) for a, b in s.conflicts()] == [(2, 3)]
+
+
+def test_sleep_folds_labels_you_confirm(s):
+    pnpm(s, "t1")
+    s.observe("uv", "tool_observed", "t2", ENV, says(action="new", statement="Repo uses uv", context=list(ENV), labels=["tooling"]))
+    s.observe("ruff", "tool_observed", "t3", ENV, says(action="new", statement="Repo uses ruff", context=list(ENV), labels=["tooling"]))
+    s.sleep(dreams(labels=[LabelMerge(reason="same", old="build", new="tooling")]), None, lambda q: True)
+    assert s.labels() == ["tooling"]
+
+
+def test_sleep_generalizes_a_pattern_from_three_repos_as_a_weak_inference(s):
+    for i, repo in enumerate(("a", "b", "c")):
+        pnpm(s, f"t{i}", ("owner:me", f"repo:{repo}"))
+    guess = says(action="new", statement="User prefers pnpm", context=[])
+    two = dreams(generalizations=[Generalization(reason="r", ids=[1, 2], statement="User prefers pnpm")])
+    assert s.sleep(two, guess, lambda q: True) == []  # two repos are not a pattern yet
+    three = dreams(generalizations=[Generalization(reason="r", ids=[1, 2, 3], statement="User prefers pnpm")])
+    s.sleep(three, guess, lambda q: False)  # generalizations need no confirmation
+    b = s.get(4)
+    assert (b.statement, b.premises, b.loose) == ("User prefers pnpm", [1, 2, 3], True)
+    s.sleep(three, says(action="supports", belief_id=4), lambda q: True)
+    assert s.get(4).n == 1  # rerunning sleep never adds a second vote

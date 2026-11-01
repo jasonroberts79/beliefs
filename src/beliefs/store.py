@@ -9,7 +9,7 @@ import os
 import sqlite3
 import threading
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +25,7 @@ WEIGHTS = {"user_said": 1.0, "tool_observed": 1.0, "document": 0.5, "agent_infer
 STRONG = {"user_said"}
 CANDIDATES = 8  # beliefs the judge sees per observation
 TIE = 0.05  # ponytail: fixed recall tie margin; tune from real recall logs
+GENERALIZE = 3  # distinct contexts a pattern must span before sleep infers a belief about the user
 DIGEST = 20  # firm beliefs in the startup digest; Claude Code truncates long instructions
 HOME = Path(os.environ.get("BELIEFS_HOME", Path.home() / ".beliefs"))
 
@@ -32,7 +33,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
-    kind TEXT NOT NULL,           -- created | evidence | label_merged | context_moved | retracted | settled
+    kind TEXT NOT NULL,           -- created | evidence | merged | label_merged | context_moved | retracted | settled
     belief_id INTEGER,
     data TEXT NOT NULL
 );
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS beliefs (
     support REAL NOT NULL,
     against REAL NOT NULL,
     n INTEGER NOT NULL,           -- sources currently holding a vote
-    status TEXT NOT NULL,         -- open | closed
+    status TEXT NOT NULL,         -- open | closed | merged
     superseded_by INTEGER,
     embedding BLOB
 );
@@ -393,6 +394,18 @@ class Store:
                 if data["old"] in labels:
                     merged = list(dict.fromkeys(data["new"] if x == data["old"] else x for x in labels))
                     self.db.execute("UPDATE beliefs SET labels = ? WHERE id = ?", (json.dumps(merged), row["id"]))
+        elif kind == "merged":
+            if self._retracted(data["source_ref"]):
+                return
+            dup, keep = data["dup"], belief_id
+            for v in self.db.execute("SELECT * FROM votes WHERE belief_id = ?", (dup,)).fetchall():
+                key = (v["source_ref"], v["source_kind"], keep)
+                if not self.db.execute("SELECT 1 FROM votes WHERE source_ref = ? AND source_kind = ? AND belief_id = ?", key).fetchone():
+                    self.db.execute(f"UPDATE beliefs SET {v['side']} = {v['side']} + ?, n = n + 1 WHERE id = ?",
+                                    (v["weight"], keep))
+                    self.db.execute("INSERT INTO votes VALUES (?, ?, ?, ?, ?)", (*key[:2], keep, v["side"], v["weight"]))
+            self.db.execute("UPDATE beliefs SET status = 'merged', superseded_by = ? WHERE id = ?", (keep, dup))
+            self.db.execute("UPDATE beliefs SET narrows = ? WHERE narrows = ?", (keep, dup))
         elif kind == "context_moved":
             for row in self.db.execute("SELECT id, context FROM beliefs").fetchall():
                 ctx = json.loads(row["context"])
@@ -415,6 +428,13 @@ class Store:
         # ponytail: scans every event per call; index rivals in their own table if this gets slow.
         retracted = {r[0] for r in self.db.execute(
             "SELECT json_extract(data, '$.source_ref') FROM events WHERE kind = 'retracted'")}
+        into = dict(self.db.execute("SELECT id, superseded_by FROM beliefs WHERE status = 'merged'").fetchall())
+
+        def canon(i):  # a conflict with a merged duplicate carries over to the belief that absorbed it
+            while i in into:
+                i = into[i]
+            return i
+
         sides = defaultdict(lambda: (set(), set()))  # obs -> (contradicted ids, supported ids)
         settled = set()
         for e in self.db.execute("SELECT kind, belief_id, data FROM events WHERE kind IN ('evidence', 'settled')"):
@@ -422,9 +442,9 @@ class Store:
             if d["source_ref"] in retracted:
                 continue
             if e["kind"] == "settled":
-                settled.add(frozenset((d["a"], d["b"])))
+                settled.add(frozenset((canon(d["a"]), canon(d["b"]))))
             elif d.get("obs") and d["verdict"] in ("contradicts", "supports"):
-                sides[d["obs"]][d["verdict"] == "supports"].add(e["belief_id"])
+                sides[d["obs"]][d["verdict"] == "supports"].add(canon(e["belief_id"]))
         pairs = {frozenset((x, y)) for against, favour in sides.values() for x in against for y in favour if x != y}
         live = {b.id: b for b in self.beliefs("status = 'open' AND n > 0")}
         return [tuple(live[i] for i in sorted(p)) for p in pairs - settled if all(i in live for i in p)]
@@ -472,6 +492,44 @@ class Store:
     def merge_labels(self, old: str, new: str) -> None:
         with self._tx():
             self._record("label_merged", None, {"old": old, "new": new})
+
+    def merge(self, dup: int, keep: int, source_ref: str) -> None:
+        """Fold a duplicate into the belief that says the same thing. Its sources' votes move over."""
+        with self._tx():
+            self._record("merged", keep, {"dup": dup, "source_ref": source_ref})
+
+    def sleep(self, consolidate, judge, confirm) -> list[str]:
+        """One offline pass over every open belief. Merges wait for `confirm`, because they close a
+        belief. Generalizations go in as agent inferences, which the trust rules already allow."""
+        beliefs = {b.id: b for b in self.beliefs("status = 'open' AND n > 0")}
+        if not beliefs:
+            return []
+        counts = Counter(label for b in beliefs.values() for label in b.labels)
+        plan = consolidate(list(beliefs.values()), dict(counts))
+        out = []
+        for m in plan.merges:
+            group = [beliefs[i] for i in dict.fromkeys(m.ids) if i in beliefs]
+            if len(group) < 2 or len({b.context for b in group}) > 1:
+                continue  # a merge across contexts would erase a scope difference
+            keep = max(group, key=lambda b: (b.firmness, -b.id))
+            for b in group:
+                if b is not keep and confirm(f"Merge {render(b)}\n into {render(keep)}\n because {m.reason}"):
+                    self.merge(b.id, keep.id, "cli")
+                    out.append(f"merged #{b.id} into #{keep.id}")
+        for lm in plan.labels:
+            if lm.old != lm.new and lm.old in counts and lm.new in counts and confirm(
+                    f"Fold label {lm.old} ({counts[lm.old]}) into {lm.new} ({counts[lm.new]}), because {lm.reason}"):
+                self.merge_labels(lm.old, lm.new)
+                out.append(f"folded label {lm.old} into {lm.new}")
+        for g in plan.generalizations:
+            group = [b for i in dict.fromkeys(g.ids) if (b := self.get(i)) and b.status == "open" and b.n > 0]
+            contexts = [b.context for b in group]
+            if len(set(contexts)) < GENERALIZE:
+                continue
+            env = os.path.commonprefix(contexts)  # works on tuples: the context all the sources share
+            # A fixed source ref holds one vote per belief, so rerunning sleep never firms up a guess.
+            out.append(self.observe(g.statement, "agent_inferred", "sleep", env, judge, [b.id for b in group]))
+        return out
 
     def move_context(self, old: str, new: list[str]) -> None:
         """Replace context element `old` with `new` in every belief that has it, such as a root commit
